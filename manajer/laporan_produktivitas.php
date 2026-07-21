@@ -28,6 +28,99 @@ try {
     // Fail silently
 }
 
+// 2b. Rekap Produktivitas Pengawasan Mandor - mandor sebagai penanggung
+// jawab alur juga dievaluasi. "Produktivitas" mandor diartikan sebagai
+// VOLUME laporan yang berhasil ditangani (bukan tonase, karena mandor
+// tidak mengerjakan panen/pupuk/semprot sendiri). Dimulai dari tabel
+// `mandor` (LEFT JOIN) supaya semua mandor terdaftar tetap muncul walau
+// tidak ada aktivitas di periode yang difilter.
+$rekap_mandor = [];
+try {
+    $sql_mandor = "
+        SELECT m.id_mandor, m.nama, m.spesialisasi,
+               COUNT(r.id) AS total_laporan_masuk,
+               SUM(CASE WHEN r.status IS NOT NULL AND r.status != 'pending_mandor' THEN 1 ELSE 0 END) AS jumlah_diverifikasi,
+               SUM(CASE WHEN r.status = 'approved' THEN 1 ELSE 0 END) AS jumlah_disetujui,
+               SUM(CASE WHEN r.status = 'rejected' OR r.status = 'pending_manajer_tolak' THEN 1 ELSE 0 END) AS jumlah_ditolak,
+               SUM(CASE WHEN r.status = 'pending_mandor' THEN 1 ELSE 0 END) AS jumlah_tertahan,
+               SUM(CASE WHEN r.potongan_penalti > 0 THEN 1 ELSE 0 END) AS jumlah_manipulasi_tertangkap,
+               AVG(TIMESTAMPDIFF(HOUR, a.tanggal, r.tanggal_verifikasi_mandor)) AS avg_jam_respon
+        FROM mandor m
+        LEFT JOIN assignments a ON a.id_mandor = m.id_mandor
+        LEFT JOIN work_reports r ON r.id_assignment = a.id
+        WHERE 1=1
+    ";
+    $params_mandor = [];
+    if (!empty($start_date)) { $sql_mandor .= " AND a.tanggal >= ?"; $params_mandor[] = $start_date; }
+    if (!empty($end_date))   { $sql_mandor .= " AND a.tanggal <= ?"; $params_mandor[] = $end_date; }
+    $sql_mandor .= " GROUP BY m.id_mandor, m.nama, m.spesialisasi ORDER BY total_laporan_masuk DESC";
+    $stmt_mandor = $pdo->prepare($sql_mandor);
+    $stmt_mandor->execute($params_mandor);
+    $rekap_mandor = $stmt_mandor->fetchAll();
+} catch (\PDOException $e) {
+    $error = "Gagal memuat rekap mandor: " . $e->getMessage();
+}
+
+// 2c. Fetch detailed pending/held-up reports per Mandor
+$all_pending_reports = [];
+$pending_by_mandor = [];
+try {
+    $sql_pending = "
+        SELECT r.*, a.tanggal, a.aktivitas, a.unit, a.target_jumlah,
+               m.nama as nama_mandor, k.nama as nama_karyawan,
+               DATEDIFF(CURRENT_DATE, a.tanggal) as hari_tertahan
+        FROM work_reports r
+        JOIN assignments a ON r.id_assignment = a.id
+        JOIN karyawan k ON r.id_karyawan = k.id_karyawan
+        LEFT JOIN mandor m ON a.id_mandor = m.id_mandor
+        WHERE r.status = 'pending_mandor'
+    ";
+    $params_pending = [];
+    if (!empty($start_date)) { $sql_pending .= " AND a.tanggal >= ?"; $params_pending[] = $start_date; }
+    if (!empty($end_date))   { $sql_pending .= " AND a.tanggal <= ?"; $params_pending[] = $end_date; }
+    $sql_pending .= " ORDER BY a.tanggal ASC, r.id ASC";
+    $stmt_pending = $pdo->prepare($sql_pending);
+    $stmt_pending->execute($params_pending);
+    $all_pending_reports = $stmt_pending->fetchAll();
+
+    foreach ($all_pending_reports as $pr) {
+        $m_name = $pr['nama_mandor'] ?? 'Mandor Lapangan';
+        $pr['tahap_tertahan'] = 'Tertahan di Mandor Lapangan';
+        $pending_by_mandor[$m_name][] = $pr;
+    }
+} catch (\PDOException $e) {
+    // Fail silently
+}
+
+// 2d. Fetch ALL reports per Mandor for Tab 4 Rincian Modal
+$mandor_all_reports = [];
+$reports_by_mandor = [];
+try {
+    $sql_m_all = "
+        SELECT r.*, a.tanggal, a.aktivitas, a.unit, a.target_jumlah,
+               m.nama as nama_mandor, k.nama as nama_karyawan
+        FROM work_reports r
+        JOIN assignments a ON r.id_assignment = a.id
+        JOIN karyawan k ON r.id_karyawan = k.id_karyawan
+        JOIN mandor m ON a.id_mandor = m.id_mandor
+        WHERE 1=1
+    ";
+    $params_m_all = [];
+    if (!empty($start_date)) { $sql_m_all .= " AND a.tanggal >= ?"; $params_m_all[] = $start_date; }
+    if (!empty($end_date))   { $sql_m_all .= " AND a.tanggal <= ?"; $params_m_all[] = $end_date; }
+    $sql_m_all .= " ORDER BY a.tanggal DESC, r.id DESC";
+    $stmt_m_all = $pdo->prepare($sql_m_all);
+    $stmt_m_all->execute($params_m_all);
+    $mandor_all_reports = $stmt_m_all->fetchAll();
+
+    foreach ($mandor_all_reports as $mar) {
+        $mname = $mar['nama_mandor'] ?? 'Mandor Lapangan';
+        $reports_by_mandor[$mname][] = $mar;
+    }
+} catch (\PDOException $e) {
+    // Fail silently
+}
+
 // 3. Build filter query
 $where = " (r.status = 'approved' OR r.bonus_diterima < 0 OR r.potongan_penalti > 0) ";
 $params = [];
@@ -40,6 +133,14 @@ if (!empty($filter_activity)) { $where .= " AND a.aktivitas = ?"; $params[] = $f
 $rekap_karyawan = [];
 $rekap_aktivitas = [];
 $task_summary = [];
+
+$status_labels = [
+    'pending_mandor'        => 'Menunggu Mandor',
+    'verified_by_mandor'    => 'Terverifikasi Mandor',
+    'approved'              => 'Disetujui',
+    'rejected'              => 'Ditolak',
+    'pending_manajer_tolak' => 'Tinjauan Sanksi',
+];
 
 try {
     // 1. Rekap per karyawan (Jika Kena Sanksi, Capaian = 0%)
@@ -153,7 +254,7 @@ try {
 <div style="margin-bottom: 25px;" class="no-print">
     <a href="index.php" style="color: var(--text-muted); font-size: 0.9rem;"><i class="fa-solid fa-arrow-left"></i> Kembali ke Dashboard</a>
     <h2 style="margin-top: 10px;">Laporan Produktivitas &amp; Insentif Bonus</h2>
-    <p style="color: var(--text-muted);">Rekapitulasi pencapaian target, ranking produktivitas, dan insentif bonus/sanksi karyawan</p>
+    <p style="color: var(--text-muted);">Rekapitulasi pencapaian target, ranking produktivitas, dan insentif bonus/sanksi karyawan serta pengawasan mandor</p>
 </div>
 
 <!-- Kop Surat Resmi (Cetak Only) -->
@@ -167,7 +268,7 @@ try {
     </div>
     <div style="text-align: center; margin-bottom: 20px;">
         <h3 style="font-family: 'Times New Roman', Times, serif; font-size: 1.25rem; font-weight: bold; text-decoration: underline; margin: 0 0 5px 0; color: #000;">
-            LAPORAN PRODUKTIVITAS &amp; INSENTIF KARYAWAN
+            LAPORAN PRODUKTIVITAS &amp; INSENTIF KARYAWAN &amp; MANDOR
         </h3>
         <p style="font-family: 'Times New Roman', Times, serif; font-size: 0.85rem; color: #000; margin: 0;">
             Manajer: <strong><?php echo htmlspecialchars($nama); ?></strong> &nbsp;|&nbsp; Tanggal Cetak: <?php echo date('d-m-Y H:i'); ?> WIB 
@@ -216,7 +317,7 @@ try {
     </form>
 </div>
 
-<!-- Stat Summary Cards (Matching User Screenshot) -->
+<!-- Stat Summary Cards -->
 <?php
 $total_gross_bonus = 0.0;
 $total_sanksi_denda = 0.0;
@@ -280,6 +381,9 @@ foreach ($rekap_karyawan as $rk) {
     </button>
     <button class="tab-btn" onclick="switchTab(event, 'tab-rekap-aktivitas')" style="padding: 10px 18px; font-weight: 600; font-size: 0.85rem; border: none; background: transparent; cursor: pointer; border-bottom: 3px solid transparent; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
         <i class="fa-solid fa-chart-pie"></i> 3. Rekap per Jenis Pekerjaan
+    </button>
+    <button class="tab-btn" onclick="switchTab(event, 'tab-produktivitas-mandor')" style="padding: 10px 18px; font-weight: 600; font-size: 0.85rem; border: none; background: transparent; cursor: pointer; border-bottom: 3px solid transparent; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
+        <i class="fa-solid fa-user-tie"></i> 4. Produktivitas Mandor (<?php echo count($rekap_mandor); ?>)
     </button>
 </div>
 
@@ -537,13 +641,205 @@ foreach ($rekap_karyawan as $rk) {
     </div>
 </div>
 
+<!-- ================= TAB 4: PRODUKTIVITAS PENGAWASAN MANDOR ================= -->
+<div id="tab-produktivitas-mandor" class="tab-content-panel" style="display: none;">
+    <div class="card glass-panel" style="margin-bottom: 25px;">
+        <div class="card-title no-print">
+            <span><i class="fa-solid fa-user-tie" style="color: var(--primary);"></i> Laporan Produktivitas Pengawasan Mandor</span>
+            <button onclick="window.print()" class="btn btn-gold btn-sm no-print"><i class="fa-solid fa-print"></i> Cetak Laporan</button>
+        </div>
+
+        <h3 class="print-only" style="font-family: 'Times New Roman', Times, serif; font-size: 1.1rem; font-weight: bold; margin-bottom: 10px; display:none;">4. Rekapitulasi Produktivitas Pengawasan Mandor (Penanggung Jawab)</h3>
+
+        <p style="color: var(--text-muted); font-size: 0.83rem; margin-top: -8px; margin-bottom: 15px;" class="no-print">
+            Mandor juga berstatus staf yang produktivitasnya dinilai - bukan dari tonase panen/pupuk/semprot (karena itu bukan tugasnya), melainkan dari volume laporan yang berhasil ditangani sebagai penanggung jawab verifikasi. Diurutkan dari yang menangani laporan paling banyak.
+        </p>
+
+        <?php if (empty($rekap_mandor)): ?>
+            <div style="text-align: center; padding: 30px 20px; color: var(--text-muted);">Belum ada data mandor terdaftar.</div>
+        <?php else: ?>
+            <div class="table-responsive">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th style="text-align: center; width: 6%;">Rank</th>
+                            <th style="width: 20%;">Nama Mandor (Penanggung Jawab)</th>
+                            <th style="width: 12%;">Spesialisasi</th>
+                            <th style="text-align: center; width: 9%;">Total Masuk</th>
+                            <th style="text-align: center; width: 10%;">Diverifikasi</th>
+                            <th style="text-align: center; width: 11%;">Tertahan (Pending)</th>
+                            <th style="text-align: center; width: 8%;">Disetujui</th>
+                            <th style="text-align: center; width: 8%;">Ditolak</th>
+                            <th style="text-align: center; width: 9%;">Manipulasi Tertangkap</th>
+                            <th style="text-align: center; width: 10%;">Rata-rata Waktu Respons</th>
+                            <th class="no-print" style="text-align: center; width: 7%;">Aksi</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php $rank_m = 1; foreach ($rekap_mandor as $rm):
+                            $jam = $rm['avg_jam_respon'] !== null ? round((float)$rm['avg_jam_respon'], 1) : null;
+                            $tot_masuk = (int)($rm['total_laporan_masuk'] ?? 0);
+                            $tot_diver = (int)($rm['jumlah_diverifikasi'] ?? 0);
+                            $tot_tertahan = (int)($rm['jumlah_tertahan'] ?? 0);
+                        ?>
+                            <tr>
+                                <td style="text-align:center;">
+                                    <?php if ($rank_m === 1 && $tot_diver > 0): ?>
+                                        <span class="badge" style="background:#2e7d321a; color:#2e7d32; border:1px solid #2e7d3244; font-weight:700;"><i class="fa-solid fa-medal"></i> #1</span>
+                                    <?php else: ?>
+                                        #<?php echo $rank_m; ?>
+                                    <?php endif; ?>
+                                </td>
+                                <td><strong><?php echo htmlspecialchars($rm['nama']); ?></strong></td>
+                                <td><?php echo htmlspecialchars($rm['spesialisasi']); ?></td>
+                                <td style="text-align: center;"><?php echo $tot_masuk; ?> Laporan</td>
+                                <td style="text-align: center; color: var(--success); font-weight: 700;"><?php echo $tot_diver; ?> Laporan</td>
+                                <td style="text-align: center;">
+                                    <?php 
+                                        $m_pending_list = $pending_by_mandor[$rm['nama']] ?? [];
+                                        $m_pending_json = htmlspecialchars(json_encode($m_pending_list), ENT_QUOTES, 'UTF-8');
+                                        $m_pending_title = 'Laporan Tertahan Pengawasan: Mandor ' . $rm['nama'];
+                                    ?>
+                                    <?php if ($tot_tertahan > 0): ?>
+                                        <button type="button" class="btn btn-sm no-print" 
+                                                onclick='openGenericReportModal(<?php echo json_encode($m_pending_title); ?>, <?php echo $m_pending_json; ?>)'
+                                                style="background:#ffebee; color:#c62828; border:1px solid #ef9a9a; font-weight:700; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 0.78rem;"
+                                                title="Klik untuk melihat rincian laporan tertahan">
+                                            <i class="fa-solid fa-hourglass-half"></i> <?php echo $tot_tertahan; ?> Tertahan
+                                        </button>
+                                        <span class="print-only" style="display:none; color: #c62828; font-weight: bold;"><?php echo $tot_tertahan; ?> Tertahan</span>
+                                    <?php else: ?>
+                                        <span style="color: var(--text-muted); font-size: 0.82rem;">0 (Lancar)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="text-align: center; color:#2e7d32; font-weight:700;"><?php echo (int)$rm['jumlah_disetujui']; ?></td>
+                                <td style="text-align: center; color:#c62828; font-weight:700;"><?php echo (int)$rm['jumlah_ditolak']; ?></td>
+                                <td style="text-align: center;">
+                                    <?php if ((int)$rm['jumlah_manipulasi_tertangkap'] > 0): ?>
+                                        <span class="badge" style="background:#e651001a; color:#e65100; border:1px solid #e6510044; font-weight:700;"><?php echo (int)$rm['jumlah_manipulasi_tertangkap']; ?> kasus</span>
+                                    <?php else: ?>
+                                        <span style="color: var(--text-muted);">0 kasus</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="text-align: center;">
+                                    <?php if ($jam === null): ?>
+                                        <span style="color: var(--text-muted);">Belum ada aktivitas</span>
+                                    <?php else: ?>
+                                        <strong><?php echo $jam >= 24 ? round($jam / 24, 1) . ' hari' : $jam . ' jam'; ?></strong>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="no-print" style="text-align: center;">
+                                    <?php 
+                                        $m_rep_list = $reports_by_mandor[$rm['nama']] ?? [];
+                                        $m_rep_json = htmlspecialchars(json_encode($m_rep_list), ENT_QUOTES, 'UTF-8');
+                                        $m_rep_title = 'Rincian Pengawasan Laporan: Mandor ' . $rm['nama'];
+                                    ?>
+                                    <?php if (!empty($m_rep_list)): ?>
+                                        <button type="button" class="btn btn-secondary btn-sm"
+                                                onclick='openGenericReportModal(<?php echo json_encode($m_rep_title); ?>, <?php echo $m_rep_json; ?>)'
+                                                style="padding: 3px 10px; font-size: 0.76rem;">
+                                            <i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Rincian
+                                        </button>
+                                    <?php else: ?>
+                                        <span style="color: var(--text-muted); font-size: 0.78rem;">-</span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php $rank_m++; endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </div>
+</div>
+
 <!-- Blok Tanda Tangan Resmi (Cetak Only) -->
 <div class="print-only" style="display:none; margin-top: 40px; page-break-inside: avoid;">
-    <div style="display: flex; justify-content: flex-end; font-family: 'Times New Roman', Times, serif; font-size: 0.9rem; color: #000;">
-        <div style="width: 250px; text-align: center;">
-            <p style="margin-bottom: 5px;">Jambi, <?php echo date('d F Y'); ?></p>
-            <p style="margin-bottom: 60px;">Disetujui oleh,</p>
+    <p style="text-align: right; font-family: 'Times New Roman', Times, serif; font-size: 0.9rem; color: #000; margin-bottom: 30px;">Jambi, <?php echo date('d F Y'); ?></p>
+    <div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 20px; font-family: 'Times New Roman', Times, serif; font-size: 0.85rem; color: #000;">
+        <?php foreach ($rekap_mandor as $rm): ?>
+            <div style="width: 180px; text-align: center;">
+                <p style="margin-bottom: 55px;">Mandor Penanggung Jawab,</p>
+                <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong><?php echo htmlspecialchars($rm['nama']); ?></strong><br>Mandor <?php echo htmlspecialchars($rm['spesialisasi']); ?></p>
+            </div>
+        <?php endforeach; ?>
+        <div style="width: 200px; text-align: center;">
+            <p style="margin-bottom: 55px;">Disetujui oleh,</p>
             <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong><?php echo htmlspecialchars($nama); ?></strong><br>Estate Manager</p>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Rincian Laporan Karyawan -->
+<div id="employeeReportModal" class="modal no-print" style="display:none; position: fixed; z-index: 99999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(15,23,42,0.7); overflow-y: auto; backdrop-filter: blur(4px);">
+    <div class="modal-dialog" style="background: #ffffff; margin: 30px auto; max-width: 850px; border-radius: 14px; padding: 0; box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; color: #1e293b;">
+        <div style="background: #f8fafc; padding: 18px 24px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h3 id="empModalTitle" style="margin: 0; font-size: 1.15rem; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px;">
+                    <i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Rincian Laporan Kerja Karyawan
+                </h3>
+                <p style="margin: 3px 0 0 0; font-size: 0.8rem; color: #64748b;">Daftar transaksi pekerjaan fisik dan status insentif/sanksi</p>
+            </div>
+            <button onclick="closeEmployeeReportModal()" style="background: transparent; border: none; font-size: 1.6rem; cursor: pointer; color: #64748b; line-height: 1;">&times;</button>
+        </div>
+        <div style="padding: 24px; max-height: 75vh; overflow-y: auto;">
+            <div class="table-responsive">
+                <table class="table" style="width: 100%; font-size: 0.83rem;">
+                    <thead>
+                        <tr>
+                            <th>Tanggal</th>
+                            <th>Aktivitas</th>
+                            <th>Mandor</th>
+                            <th>Target Dasar</th>
+                            <th>Realisasi</th>
+                            <th>Status Alur</th>
+                            <th>Bonus / Penalti</th>
+                        </tr>
+                    </thead>
+                    <tbody id="empModalBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div style="background: #f8fafc; padding: 14px 24px; border-top: 1px solid #e2e8f0; text-align: right;">
+            <button onclick="closeEmployeeReportModal()" class="btn btn-secondary btn-sm" style="padding: 7px 22px; font-weight: 600; border-radius: 6px;">Tutup</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Rincian Generic (Penugasan / Aktivitas) -->
+<div id="genericReportModal" class="modal no-print" style="display:none; position: fixed; z-index: 99999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(15,23,42,0.7); overflow-y: auto; backdrop-filter: blur(4px);">
+    <div class="modal-dialog" style="background: #ffffff; margin: 30px auto; max-width: 850px; border-radius: 14px; padding: 0; box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; color: #1e293b;">
+        <div style="background: #f8fafc; padding: 18px 24px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h3 id="genModalTitle" style="margin: 0; font-size: 1.15rem; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px;">
+                    <i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Rincian Data Laporan
+                </h3>
+                <p style="margin: 3px 0 0 0; font-size: 0.8rem; color: #64748b;">Rincian transaksi laporan kerja per kategori</p>
+            </div>
+            <button onclick="closeGenericReportModal()" style="background: transparent; border: none; font-size: 1.6rem; cursor: pointer; color: #64748b; line-height: 1;">&times;</button>
+        </div>
+        <div style="padding: 24px; max-height: 75vh; overflow-y: auto;">
+            <div class="table-responsive">
+                <table class="table" style="width: 100%; font-size: 0.83rem;">
+                    <thead>
+                        <tr>
+                            <th>Tanggal</th>
+                            <th>Karyawan</th>
+                            <th>Mandor</th>
+                            <th>Aktivitas</th>
+                            <th>Target Dasar</th>
+                            <th>Realisasi</th>
+                            <th>Status Alur</th>
+                        </tr>
+                    </thead>
+                    <tbody id="genModalBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div style="background: #f8fafc; padding: 14px 24px; border-top: 1px solid #e2e8f0; text-align: right;">
+            <button onclick="closeGenericReportModal()" class="btn btn-secondary btn-sm" style="padding: 7px 22px; font-weight: 600; border-radius: 6px;">Tutup</button>
         </div>
     </div>
 </div>
@@ -790,161 +1086,81 @@ function switchTab(evt, tabId) {
     evt.currentTarget.classList.add('active');
 }
 
-function openEmployeeReportModal(empId, empName, reports) {
-    document.getElementById('empModalName').innerText = empName;
-    const body = document.getElementById('empModalBody');
+function openEmployeeReportModal(empId, empName, reportsData) {
+    const titleEl = document.getElementById('empModalTitle');
+    if (titleEl) titleEl.innerHTML = `<i class="fa-solid fa-user-check" style="color: var(--primary-light);"></i> Rincian Laporan: <strong>${empName}</strong>`;
     
-    if (!reports || reports.length === 0) {
-        body.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">Tidak ada rincian laporan untuk karyawan ini dalam periode yang dipilih.</div>';
+    const bodyEl = document.getElementById('empModalBody');
+    if (!bodyEl) return;
+    
+    if (!reportsData || reportsData.length === 0) {
+        bodyEl.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 20px;">Tidak ada data laporan fisik.</td></tr>`;
     } else {
-        let html = `
-            <table class="table" style="width: 100%; font-size: 0.82rem; border-collapse: collapse; margin: 0;">
-                <thead>
-                    <tr style="background: var(--bg-hover, #f8fafc);">
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">Tanggal</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0;">Aktivitas</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0;">Mandor</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Target</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Realisasi</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">% Capaian</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">Status</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Bonus / Denda</th>
-                    </tr>
-                </thead>
-                <tbody>
-        `;
-        
-        reports.forEach(r => {
-            const isPenalized = (r.status === 'rejected' || r.potongan_penalti > 0);
-            const realOutput = isPenalized ? 0 : r.jumlah_realisasi;
-            const pct = r.target_jumlah > 0 ? Math.round((realOutput / r.target_jumlah) * 100) : 0;
+        let rowsHtml = '';
+        reportsData.forEach(r => {
+            let bonusStr = '-';
+            if (r.bonus_diterima > 0) bonusStr = `<strong style="color: var(--success);">+Rp ${r.bonus_diterima.toLocaleString('id-ID')}</strong>`;
+            else if (r.bonus_diterima < 0) bonusStr = `<strong style="color: #c62828;">-Rp ${Math.abs(r.bonus_diterima).toLocaleString('id-ID')}</strong>`;
             
-            let statusBg = '#0d6efd1a', statusColor = '#0d6efd';
-            if (r.status === 'approved' && !isPenalized) { statusBg = '#2e7d321a'; statusColor = '#2e7d32'; }
-            else if (isPenalized) { statusBg = '#c628281a'; statusColor = '#c62828'; }
-            
-            let bonusStr = '<span style="color: var(--text-muted);">-</span>';
-            if (r.bonus_diterima > 0) {
-                bonusStr = `<span style="color: #2e7d32; font-weight: 700;">+Rp ${new Intl.NumberFormat('id-ID').format(r.bonus_diterima)}</span>`;
-            } else if (r.bonus_diterima < 0) {
-                bonusStr = `<span style="color: #c62828; font-weight: 700;">-Rp ${new Intl.NumberFormat('id-ID').format(Math.abs(r.bonus_diterima))} (Sanksi 10%)</span>`;
-            }
-            
-            html += `
+            rowsHtml += `
                 <tr>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center; white-space: nowrap;">${r.tanggal}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; font-weight: 600;">${r.aktivitas}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${r.nama_mandor}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right;">${r.target_jumlah} ${r.unit}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right; font-weight: 700;">${realOutput} ${r.unit}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center; font-weight: 700; color: ${pct >= 100 ? '#2e7d32' : (pct >= 80 ? '#e0a800' : '#c62828')};">${pct}%</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center;">
-                        <span class="badge" style="background: ${statusBg}; color: ${statusColor}; padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 0.75rem;">
-                            ${r.status_label}
-                        </span>
-                    </td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right;">${bonusStr}</td>
+                    <td>${r.tanggal}</td>
+                    <td><strong>${r.aktivitas}</strong></td>
+                    <td>${r.nama_mandor}</td>
+                    <td>${r.target_jumlah} ${r.unit}</td>
+                    <td><strong>${r.jumlah_realisasi} ${r.unit}</strong></td>
+                    <td><span class="badge" style="background:#0d6efd1a; color:#0d6efd; border:1px solid #0d6efd44;">${r.status_label || r.status}</span></td>
+                    <td>${bonusStr}</td>
                 </tr>
             `;
         });
-        
-        html += '</tbody></table>';
-        body.innerHTML = html;
+        bodyEl.innerHTML = rowsHtml;
     }
     
-    document.getElementById('employeeDetailModal').style.display = 'block';
+    const modal = document.getElementById('employeeReportModal');
+    if (modal) modal.style.display = 'block';
 }
 
-function closeEmployeeModal() {
-    document.getElementById('employeeDetailModal').style.display = 'none';
+function closeEmployeeReportModal() {
+    const modal = document.getElementById('employeeReportModal');
+    if (modal) modal.style.display = 'none';
 }
 
-function openGenericReportModal(titleText, reports) {
-    document.getElementById('empModalName').innerText = titleText;
-    const body = document.getElementById('empModalBody');
+function openGenericReportModal(titleStr, reportsData) {
+    const titleEl = document.getElementById('genModalTitle');
+    if (titleEl) titleEl.innerHTML = `<i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> ${titleStr}`;
     
-    if (!reports || reports.length === 0) {
-        body.innerHTML = '<div style="text-align: center; padding: 30px; color: var(--text-muted);">Tidak ada rincian laporan untuk kategori ini.</div>';
+    const bodyEl = document.getElementById('genModalBody');
+    if (!bodyEl) return;
+    
+    if (!reportsData || reportsData.length === 0) {
+        bodyEl.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 20px;">Tidak ada data laporan.</td></tr>`;
     } else {
-        let html = `
-            <table class="table" style="width: 100%; font-size: 0.82rem; border-collapse: collapse; margin: 0;">
-                <thead>
-                    <tr style="background: var(--bg-hover, #f8fafc);">
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">Tanggal</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0;">Karyawan</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0;">Mandor</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0;">Aktivitas</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Target</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Realisasi</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">% Capaian</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: center;">Status</th>
-                        <th style="padding: 9px 8px; border: 1px solid #e2e8f0; text-align: right;">Bonus / Denda</th>
-                    </tr>
-                </thead>
-                <tbody>
-        `;
-        
-        reports.forEach(r => {
-            const isPenalized = (r.status === 'rejected' || r.potongan_penalti > 0);
-            const realOutput = isPenalized ? 0 : r.jumlah_realisasi;
-            const pct = r.target_jumlah > 0 ? Math.round((realOutput / r.target_jumlah) * 100) : 0;
-            
-            let statusBg = '#0d6efd1a', statusColor = '#0d6efd';
-            if (r.status === 'approved' && !isPenalized) { statusBg = '#2e7d321a'; statusColor = '#2e7d32'; }
-            else if (isPenalized) { statusBg = '#c628281a'; statusColor = '#c62828'; }
-            
-            let bonusStr = '<span style="color: var(--text-muted);">-</span>';
-            if (r.bonus_diterima > 0) {
-                bonusStr = `<span style="color: #2e7d32; font-weight: 700;">+Rp ${new Intl.NumberFormat('id-ID').format(r.bonus_diterima)}</span>`;
-            } else if (r.bonus_diterima < 0) {
-                bonusStr = `<span style="color: #c62828; font-weight: 700;">-Rp ${new Intl.NumberFormat('id-ID').format(Math.abs(r.bonus_diterima))} (Sanksi 10%)</span>`;
-            }
-            
-            html += `
+        let rowsHtml = '';
+        reportsData.forEach(r => {
+            rowsHtml += `
                 <tr>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center; white-space: nowrap;">${r.tanggal}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; font-weight: 700;">${r.nama_karyawan}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${r.nama_mandor}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${r.aktivitas}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right;">${r.target_jumlah} ${r.unit}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right; font-weight: 700;">${realOutput} ${r.unit}</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center; font-weight: 700; color: ${pct >= 100 ? '#2e7d32' : (pct >= 80 ? '#e0a800' : '#c62828')};">${pct}%</td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: center;">
-                        <span class="badge" style="background: ${statusBg}; color: ${statusColor}; padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 0.75rem;">
-                            ${r.status_label}
-                        </span>
-                    </td>
-                    <td style="padding: 8px; border: 1px solid #e2e8f0; text-align: right;">${bonusStr}</td>
+                    <td>${r.tanggal}</td>
+                    <td><strong>${r.nama_karyawan}</strong></td>
+                    <td>${r.nama_mandor}</td>
+                    <td>${r.aktivitas}</td>
+                    <td>${r.target_jumlah} ${r.unit}</td>
+                    <td><strong>${r.jumlah_realisasi} ${r.unit}</strong></td>
+                    <td><span class="badge" style="background:#0d6efd1a; color:#0d6efd; border:1px solid #0d6efd44;">${r.status_label || r.status}</span></td>
                 </tr>
             `;
         });
-        
-        html += '</tbody></table>';
-        body.innerHTML = html;
+        bodyEl.innerHTML = rowsHtml;
     }
     
-    document.getElementById('employeeDetailModal').style.display = 'block';
+    const modal = document.getElementById('genericReportModal');
+    if (modal) modal.style.display = 'block';
+}
+
+function closeGenericReportModal() {
+    const modal = document.getElementById('genericReportModal');
+    if (modal) modal.style.display = 'none';
 }
 </script>
-
-<!-- Modal Rincian Seluruh Laporan Karyawan (Pop Up) -->
-<div id="employeeDetailModal" class="modal no-print" style="display:none; position: fixed; z-index: 99999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); overflow-y: auto;">
-    <div class="modal-dialog" style="background: var(--bg-card, #ffffff); margin: 40px auto; max-width: 920px; border-radius: 12px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); color: var(--text-color);">
-        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e2e8f0; padding-bottom: 12px; margin-bottom: 16px;">
-            <h3 style="margin: 0; font-size: 1.15rem; color: var(--primary-light); font-weight: 700; display: flex; align-items: center; gap: 8px;">
-                <i class="fa-solid fa-list-check"></i> Rincian Seluruh Laporan Kerja: <span id="empModalName" style="color: var(--text-color); font-weight: 800;"></span>
-            </h3>
-            <button onclick="closeEmployeeModal()" style="background: transparent; border: none; font-size: 1.5rem; cursor: pointer; color: var(--text-muted);">&times;</button>
-        </div>
-        
-        <div id="empModalBody" style="max-height: 480px; overflow-y: auto;">
-            <!-- Dynamic Table injected via JS -->
-        </div>
-
-        <div style="text-align: right; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 12px;">
-            <button onclick="closeEmployeeModal()" class="btn btn-secondary btn-sm" style="padding: 6px 18px; border-radius: 6px; font-weight: 600;">Tutup</button>
-        </div>
-    </div>
-</div>
 
 <?php require_once '../includes/footer.php'; ?>

@@ -360,13 +360,17 @@ if ($avg_achievement >= 80) {
     <?php endif; ?>
 </div>
 
-<!-- Blok Tanda Tangan (Print Only) -->
-<div class="print-only" style="display:none; margin-top: 50px; page-break-inside: avoid;">
-    <div style="display: flex; justify-content: flex-end; font-size: 0.85rem; color: #000;">
-        <div style="width: 250px; text-align: center;">
-            <p style="margin-bottom: 5px;">Batam, <?php echo date('d F Y'); ?></p>
-            <p style="margin-bottom: 60px;">Disetujui oleh,</p>
+<!-- Blok Tanda Tangan Resmi (Print Only) -->
+<div class="print-only" style="display:none; margin-top: 40px; page-break-inside: avoid;">
+    <p style="text-align: right; font-family: 'Times New Roman', Times, serif; font-size: 0.9rem; color: #000; margin-bottom: 25px;">Jambi, <?php echo date('d F Y'); ?></p>
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; font-family: 'Times New Roman', Times, serif; font-size: 0.85rem; color: #000;">
+        <div style="width: 220px; text-align: center;">
+            <p style="margin-bottom: 55px; margin-top: 0;">Pelaksana Pekerjaan,</p>
             <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong><?php echo htmlspecialchars($nama); ?></strong><br>Karyawan Lapangan</p>
+        </div>
+        <div style="width: 220px; text-align: center;">
+            <p style="margin-bottom: 55px; margin-top: 0;">Pemeriksa / Verifikator,</p>
+            <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong>Mandor Penanggung Jawab</strong><br>Mandor Lapangan</p>
         </div>
     </div>
 </div>

@@ -117,6 +117,119 @@ foreach ($reports as $rep) {
         }
     }
 }
+
+// 5. QUICK FILTER "HARI INI"
+$filter_today = isset($_GET['quick_today']) && $_GET['quick_today'] === '1';
+
+function build_qs($overrides = [], $remove = []) {
+    $qs = $_GET;
+    foreach ($remove as $r) { unset($qs[$r]); }
+    foreach ($overrides as $k => $v) { $qs[$k] = $v; }
+    return htmlspecialchars('?' . http_build_query($qs));
+}
+
+// 6. DATA PENGAWASAN MANDOR
+$sup_where = "1=1";
+$sup_params = [];
+if ($filter_today) {
+    $sup_where .= " AND a.tanggal = CURDATE()";
+} else {
+    if (!empty($start_date)) { $sup_where .= " AND a.tanggal >= ?"; $sup_params[] = $start_date; }
+    if (!empty($end_date))   { $sup_where .= " AND a.tanggal <= ?"; $sup_params[] = $end_date; }
+}
+if ($filter_mandor > 0) { $sup_where .= " AND a.id_mandor = ?"; $sup_params[] = $filter_mandor; }
+
+$mandor_stats = [];
+try {
+    $sql_sup = "
+        SELECT a.id, a.tanggal, a.aktivitas, a.target_jumlah, a.unit,
+               a.id_mandor, a.id_karyawan, k.nama as nama_karyawan, m.nama as nama_mandor,
+               r.id as report_id, r.status as report_status, r.jumlah_realisasi, r.foto_bukti,
+               r.catatan_karyawan, r.catatan_mandor, r.tanggal_verifikasi_mandor,
+               r.catatan_manajer, r.tanggal_verifikasi_manajer, r.bonus_diterima
+        FROM assignments a
+        JOIN karyawan k ON a.id_karyawan = k.id_karyawan
+        JOIN mandor m ON a.id_mandor = m.id_mandor
+        LEFT JOIN work_reports r ON r.id_assignment = a.id
+        WHERE $sup_where
+        ORDER BY a.tanggal DESC, m.nama ASC, k.nama ASC
+    ";
+    $stmt_sup = $pdo->prepare($sql_sup);
+    $stmt_sup->execute($sup_params);
+    $sup_rows = $stmt_sup->fetchAll();
+
+    foreach ($sup_rows as $row) {
+        $mid = $row['id_mandor'];
+        if (!isset($mandor_stats[$mid])) {
+            $mandor_stats[$mid] = [
+                'nama' => $row['nama_mandor'],
+                'karyawan_set' => [],
+                'total_tugas' => 0,
+                'belum_lapor' => 0,
+                'per_aktivitas' => [],
+                'detail' => [],
+                'belum_lapor_list' => [],
+            ];
+        }
+        $mandor_stats[$mid]['karyawan_set'][$row['id_karyawan']] = true;
+        $mandor_stats[$mid]['total_tugas']++;
+        if (!isset($mandor_stats[$mid]['per_aktivitas'][$row['aktivitas']])) {
+            $mandor_stats[$mid]['per_aktivitas'][$row['aktivitas']] = 0;
+        }
+        $mandor_stats[$mid]['per_aktivitas'][$row['aktivitas']]++;
+
+        $is_belum_lapor = $row['report_id'] === null;
+        $status_key = $is_belum_lapor ? 'belum_lapor' : $row['report_status'];
+        $status_label_disp = $is_belum_lapor ? 'Belum Lapor' : ($status_labels[$row['report_status']] ?? $row['report_status']);
+
+        $detail_json = base64_encode(json_encode([
+            'nama_karyawan'    => $row['nama_karyawan'],
+            'nama_mandor'      => $row['nama_mandor'],
+            'tanggal_kerja'    => date('d F Y', strtotime($row['tanggal'])),
+            'aktivitas'        => $row['aktivitas'],
+            'target_jumlah'    => (float)$row['target_jumlah'],
+            'unit'             => $row['unit'],
+            'jumlah_realisasi' => (float)($row['jumlah_realisasi'] ?? 0),
+            'catatan_karyawan' => $row['catatan_karyawan'] ?? '',
+            'foto_bukti'       => !empty($row['foto_bukti']) ? '../' . $row['foto_bukti'] : '',
+            'status'           => $status_key,
+            'status_label'     => $status_label_disp,
+            'catatan_mandor'   => $row['catatan_mandor'] ?? '',
+            'waktu_mandor'     => $row['tanggal_verifikasi_mandor'] ? date('d-m-Y H:i', strtotime($row['tanggal_verifikasi_mandor'])) : '',
+            'catatan_manajer'  => $row['catatan_manajer'] ?? '',
+            'waktu_manajer'    => $row['tanggal_verifikasi_manajer'] ? date('d-m-Y H:i', strtotime($row['tanggal_verifikasi_manajer'])) : '',
+            'bonus_diterima'   => (float)($row['bonus_diterima'] ?? 0),
+        ]));
+
+        $detail_row = [
+            'tanggal'      => $row['tanggal'],
+            'nama_karyawan'=> $row['nama_karyawan'],
+            'aktivitas'    => $row['aktivitas'],
+            'status_key'   => $status_key,
+            'status_label' => $status_label_disp,
+            'has_report'   => !$is_belum_lapor,
+            'detail_json'  => $detail_json,
+        ];
+        $mandor_stats[$mid]['detail'][] = $detail_row;
+
+        if ($is_belum_lapor) {
+            $mandor_stats[$mid]['belum_lapor']++;
+            $mandor_stats[$mid]['belum_lapor_list'][] = $detail_row;
+        }
+    }
+} catch (\PDOException $e) {
+    $error = $error ?: ("Gagal memuat data pengawasan mandor: " . $e->getMessage());
+}
+
+$total_mandor_dipantau = count($mandor_stats);
+$total_karyawan_unik_all = [];
+$total_tugas_all = 0;
+$total_belum_lapor_all = 0;
+foreach ($mandor_stats as $ms) {
+    foreach (array_keys($ms['karyawan_set']) as $kid) { $total_karyawan_unik_all[$kid] = true; }
+    $total_tugas_all += $ms['total_tugas'];
+    $total_belum_lapor_all += $ms['belum_lapor'];
+}
 ?>
 
 <div style="margin-bottom: 25px;" class="no-print">
@@ -201,6 +314,9 @@ foreach ($reports as $rep) {
     </button>
     <button class="tab-btn" onclick="switchTab(event, 'tab-laporan-tertahan')" style="padding: 10px 18px; font-weight: 600; font-size: 0.85rem; border: none; background: transparent; cursor: pointer; border-bottom: 3px solid transparent; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
         <i class="fa-solid fa-triangle-exclamation"></i> 2. Laporan Tertahan / SLA (<?php echo $total_tindak_lanjut; ?>)
+    </button>
+    <button class="tab-btn" onclick="switchTab(event, 'tab-pengawasan-mandor')" style="padding: 10px 18px; font-weight: 600; font-size: 0.85rem; border: none; background: transparent; cursor: pointer; border-bottom: 3px solid transparent; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
+        <i class="fa-solid fa-user-tie"></i> 3. Pengawasan Mandor (<?php echo $total_mandor_dipantau; ?>)
     </button>
 </div>
 
@@ -397,14 +513,371 @@ foreach ($reports as $rep) {
     </div>
 </div>
 
+<!-- ================= TAB 3: PENGAWASAN MANDOR ================= -->
+<div id="tab-pengawasan-mandor" class="tab-content-panel" style="display: none;">
+
+    <!-- Pintasan Filter Hari Ini -->
+    <div class="card glass-panel no-print" style="margin-bottom: 16px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <span style="font-size: 0.85rem; font-weight: 700; color: var(--text-color); display: flex; align-items: center; gap: 6px;">
+            <i class="fa-solid fa-bolt" style="color: var(--primary-light);"></i> Pintasan:
+        </span>
+        <a href="<?php echo build_qs(['quick_today' => '1']); ?>" class="btn btn-sm <?php echo $filter_today ? 'btn-primary' : 'btn-secondary'; ?>" style="padding: 5px 14px; border-radius: 6px; font-weight: 600;">
+            <i class="fa-regular fa-calendar-check"></i> Hari Ini
+        </a>
+        <?php if ($filter_today): ?>
+            <a href="<?php echo build_qs([], ['quick_today']); ?>" class="btn btn-sm btn-secondary" style="padding: 5px 14px; border-radius: 6px; font-weight: 600;">
+                <i class="fa-solid fa-rotate-left"></i> Kembali ke Filter Rentang Tanggal
+            </a>
+        <?php endif; ?>
+        <span style="font-size: 0.78rem; color: var(--text-muted); margin-left: auto;">
+            <?php echo $filter_today ? ('Menampilkan tugas tanggal ' . date('d F Y') . ' saja') : 'Mengikuti filter rentang tanggal &amp; mandor di panel atas'; ?>
+        </span>
+    </div>
+
+    <div class="alert alert-info no-print" style="background: rgba(46,125,50,0.03); border: 1.5px solid var(--primary-light); color: var(--text-color); padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.83rem; line-height: 1.5;">
+        <div style="font-weight: 700; color: var(--primary); margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+            <i class="fa-solid fa-circle-info"></i> Tentang Bagian Ini
+        </div>
+        Section ini murni untuk <strong>memantau</strong> apa saja yang berada di bawah pengawasan tiap mandor hari demi hari &mdash; bukan untuk menilai kinerja mandor. Ranking &amp; penilaian kualitas verifikasi mandor ada di menu <strong>Laporan Produktivitas</strong>.
+    </div>
+
+    <!-- Ringkasan Global -->
+    <div class="grid-3 no-print" style="margin-bottom: 20px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+        <div class="card glass-panel" style="padding: 14px; text-align:center; border-top: 3px solid var(--primary-light); margin:0;">
+            <div style="font-size: 1.5rem; font-weight: 700; color: var(--primary-light);"><?php echo $total_mandor_dipantau; ?></div>
+            <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-top: 2px;">Mandor Dipantau</div>
+        </div>
+        <div class="card glass-panel" style="padding: 14px; text-align:center; border-top: 3px solid #0d6efd; margin:0;">
+            <div style="font-size: 1.5rem; font-weight: 700; color: #0d6efd;"><?php echo count($total_karyawan_unik_all); ?></div>
+            <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-top: 2px;">Karyawan Unik Dipantau</div>
+        </div>
+        <div class="card glass-panel" style="padding: 14px; text-align:center; border-top: 3px solid #c62828; margin:0;">
+            <div style="font-size: 1.5rem; font-weight: 700; color: #c62828;"><?php echo $total_belum_lapor_all; ?></div>
+            <div style="font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-top: 2px;">Tugas Belum Ada Laporan</div>
+        </div>
+    </div>
+
+    <!-- Grafik Jumlah Tugas per Mandor -->
+    <?php if (!empty($mandor_stats)): ?>
+    <div class="card glass-panel no-print" style="margin-bottom: 20px; padding: 18px;">
+        <h4 style="font-size: 0.95rem; font-weight: 700; color: var(--text-color); margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
+            <i class="fa-solid fa-chart-column" style="color: var(--primary-light);"></i> Grafik Jumlah Tugas per Mandor
+        </h4>
+        <p style="font-size: 0.78rem; color: var(--text-muted); margin: 0 0 12px 0;">Sekadar perbandingan volume tugas yang dipantau, bukan ranking kinerja.</p>
+        <div style="height: 200px; position: relative;">
+            <canvas id="mandorTaskChart"></canvas>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <?php if (empty($mandor_stats)): ?>
+        <div class="card glass-panel" style="text-align: center; padding: 30px 20px; color: var(--text-muted);">Tidak ada data penugasan yang cocok dengan filter.</div>
+    <?php else: ?>
+
+        <!-- 1. Master Table: Rekapitulasi Pengawasan Mandor -->
+        <div class="card glass-panel" style="margin-bottom: 25px;">
+            <div class="card-title no-print">
+                <span><i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Ringkasan Rekapitulasi Pengawasan Mandor</span>
+                <button onclick="window.print()" class="btn btn-gold btn-sm no-print"><i class="fa-solid fa-print"></i> Cetak Laporan</button>
+            </div>
+
+            <h3 class="print-only" style="font-family: 'Times New Roman', Times, serif; font-size: 1.1rem; font-weight: bold; margin-bottom: 10px; display:none;">3. Rekapitulasi Pengawasan Mandor Lapangan</h3>
+
+            <div class="table-responsive">
+                <table class="table" style="width: 100%;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: center; width: 5%;">No</th>
+                            <th style="width: 22%;">Nama Mandor (Penanggung Jawab)</th>
+                            <th style="text-align: center; width: 13%;">Karyawan Dipantau</th>
+                            <th style="text-align: center; width: 11%;">Total Tugas</th>
+                            <th style="text-align: center; width: 12%;">Sudah Dilaporkan</th>
+                            <th style="text-align: center; width: 12%;">Belum Ada Laporan</th>
+                            <th style="width: 25%;">Breakdown Jenis Pekerjaan</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php $no_m = 1; foreach ($mandor_stats as $mid => $ms): 
+                            $sudah_lapor = $ms['total_tugas'] - $ms['belum_lapor'];
+                        ?>
+                            <tr>
+                                <td style="text-align: center; font-weight: 600;"><?php echo $no_m++; ?></td>
+                                <td>
+                                    <strong><i class="fa-solid fa-user-tie" style="color: var(--primary-light); margin-right: 4px;"></i> <?php echo htmlspecialchars($ms['nama']); ?></strong>
+                                </td>
+                                <td style="text-align: center;">
+                                    <span class="badge" style="background:#0d6efd1a; color:#0d6efd; border:1px solid #0d6efd44;">
+                                        <?php echo count($ms['karyawan_set']); ?> Karyawan
+                                    </span>
+                                </td>
+                                <td style="text-align: center; font-weight: 700;"><?php echo $ms['total_tugas']; ?> Tugas</td>
+                                <td style="text-align: center; color: var(--success); font-weight: 700;"><?php echo $sudah_lapor; ?> Laporan</td>
+                                <td style="text-align: center;">
+                                    <?php if ($ms['belum_lapor'] > 0): ?>
+                                        <span class="badge" style="background:#ffebee; color:#c62828; border:1px solid #ef9a9a; font-weight:700;">
+                                            <?php echo $ms['belum_lapor']; ?> Belum Lapor
+                                        </span>
+                                    <?php else: ?>
+                                        <span style="color: var(--text-muted); font-size: 0.82rem;">0 (Lengkap)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                                        <?php foreach ($ms['per_aktivitas'] as $akt => $jml): ?>
+                                            <span class="badge" style="background:#f1f5f9; color:#334155; border:1px solid #e2e8f0; font-size: 0.72rem; font-weight: 600;">
+                                                <?php echo htmlspecialchars($akt); ?>: <?php echo $jml; ?>
+                                            </span>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 2. Rincian Detail Tugas Per Mandor -->
+        <h4 class="no-print" style="margin-top: 25px; margin-bottom: 15px; font-weight: 700; color: var(--text-color); font-size: 0.95rem; display: flex; align-items: center; gap: 8px;">
+            <i class="fa-solid fa-folder-open" style="color: var(--primary-light);"></i> Rincian Detail Tugas di Bawah Pengawasan Mandor
+        </h4>
+
+        <?php foreach ($mandor_stats as $mid => $ms): ?>
+            <div class="card glass-panel" style="margin-bottom: 18px; padding: 18px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px;">
+                    <div style="font-weight: 700; font-size: 1rem; display: flex; align-items: center; gap: 8px; color: var(--text-color);">
+                        <i class="fa-solid fa-user-tie" style="color: var(--primary-light);"></i> Mandor: <strong><?php echo htmlspecialchars($ms['nama']); ?></strong>
+                    </div>
+                    <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                        <span class="badge" style="background:#0d6efd1a; color:#0d6efd; border:1px solid #0d6efd44;">
+                            <i class="fa-solid fa-users"></i> <?php echo count($ms['karyawan_set']); ?> Karyawan
+                        </span>
+                        <span class="badge" style="background:#2e7d321a; color:#2e7d32; border:1px solid #2e7d3244;">
+                            <i class="fa-solid fa-list-check"></i> <?php echo $ms['total_tugas']; ?> Total Tugas
+                        </span>
+                        <span class="badge" style="background:<?php echo $ms['belum_lapor'] > 0 ? '#c628281a' : '#f1f5f9'; ?>; color:<?php echo $ms['belum_lapor'] > 0 ? '#c62828' : '#64748b'; ?>; border:1px solid <?php echo $ms['belum_lapor'] > 0 ? '#c6282844' : '#e2e8f0'; ?>;">
+                            <i class="fa-solid fa-triangle-exclamation"></i> <?php echo $ms['belum_lapor']; ?> Belum Lapor
+                        </span>
+                    </div>
+                </div>
+
+                <?php if ($ms['belum_lapor'] > 0): ?>
+                <!-- Sub-tabel Tugas Belum Ada Laporan -->
+                <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;" class="no-print">
+                    <div style="font-size: 0.8rem; font-weight: 700; color: #b91c1c; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+                        <i class="fa-solid fa-triangle-exclamation"></i> Alert: Tugas Belum Ada Laporan (<?php echo $ms['belum_lapor']; ?> Tugas)
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table" style="margin: 0;">
+                            <thead>
+                                <tr>
+                                    <th style="width: 20%;">Tanggal Kerja</th>
+                                    <th style="width: 40%;">Pelaksana (Karyawan)</th>
+                                    <th style="width: 40%;">Aktivitas Pekerjaan</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($ms['belum_lapor_list'] as $bl): ?>
+                                    <tr>
+                                        <td style="text-align: center; font-size: 0.82rem;"><?php echo date('d-m-Y', strtotime($bl['tanggal'])); ?></td>
+                                        <td><strong><?php echo htmlspecialchars($bl['nama_karyawan']); ?></strong></td>
+                                        <td><?php echo htmlspecialchars($bl['aktivitas']); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <?php endif; ?>
+
+                <!-- Rincian Lengkap Semua Tugas di Bawah Pengawasan -->
+                <button type="button" class="btn btn-secondary btn-sm no-print" onclick="toggleMandorDetail(<?php echo $mid; ?>)" style="margin-bottom: 8px; padding: 6px 14px; font-size: 0.78rem; font-weight: 600; border-radius: 6px;">
+                    <i class="fa-solid fa-list"></i> Lihat/Tutup Rincian Lengkap Semua Tugas (<?php echo $ms['total_tugas']; ?> Tugas)
+                </button>
+                <div id="mandorDetail<?php echo $mid; ?>" style="display: none;">
+                    <div class="table-responsive">
+                        <table class="table" style="width: 100%;">
+                            <thead>
+                                <tr>
+                                    <th style="width: 15%; text-align: center;">Tanggal Kerja</th>
+                                    <th style="width: 25%;">Pelaksana (Karyawan)</th>
+                                    <th style="width: 25%;">Aktivitas Pekerjaan</th>
+                                    <th style="width: 20%; text-align: center;">Status Verifikasi</th>
+                                    <th class="no-print" style="width: 15%; text-align: center;">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($ms['detail'] as $d): 
+                                    $sc = $d['status_key'] === 'belum_lapor' ? '#c62828' : ($status_colors[$d['status_key']] ?? '#64748b');
+                                ?>
+                                    <tr>
+                                        <td style="text-align: center; font-size: 0.82rem; white-space: nowrap;"><?php echo date('d-m-Y', strtotime($d['tanggal'])); ?></td>
+                                        <td><strong><?php echo htmlspecialchars($d['nama_karyawan']); ?></strong></td>
+                                        <td><?php echo htmlspecialchars($d['aktivitas']); ?></td>
+                                        <td style="text-align:center;">
+                                            <span class="badge" style="background: <?php echo $sc; ?>1a; color: <?php echo $sc; ?>; border: 1px solid <?php echo $sc; ?>44;">
+                                                <?php echo htmlspecialchars($d['status_label']); ?>
+                                            </span>
+                                        </td>
+                                        <td class="no-print" style="text-align: center;">
+                                            <?php if ($d['has_report']): ?>
+                                                <button type="button" class="btn btn-secondary btn-sm" data-detail="<?php echo $d['detail_json']; ?>" onclick="openMonitoringDetailModal(this)" style="padding: 3px 10px; font-size: 0.76rem;">
+                                                    <i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Detail
+                                                </button>
+                                            <?php else: ?>
+                                                <span style="font-size: 0.75rem; color: var(--text-muted); font-style: italic;">Belum ada laporan</span>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        <?php endforeach; ?>
+    <?php endif; ?>
+</div>
+
 <!-- Blok Tanda Tangan Resmi (Cetak Only) -->
+<?php
+$nama_mandor_ttd = "Mandor Lapangan";
+if ($filter_mandor > 0) {
+    foreach ($foremen as $f_item) {
+        if ((int)$f_item['id_mandor'] === $filter_mandor) {
+            $nama_mandor_ttd = $f_item['nama'];
+            break;
+        }
+    }
+}
+?>
 <div class="print-only" style="display:none; margin-top: 40px; page-break-inside: avoid;">
-    <div style="display: flex; justify-content: flex-end; font-family: 'Times New Roman', Times, serif; font-size: 0.9rem; color: #000;">
-        <div style="width: 250px; text-align: center;">
-            <p style="margin-bottom: 5px;">Jambi, <?php echo date('d F Y'); ?></p>
-            <p style="margin-bottom: 60px;">Disetujui oleh,</p>
+    <p style="text-align: right; font-family: 'Times New Roman', Times, serif; font-size: 0.9rem; color: #000; margin-bottom: 25px;">Jambi, <?php echo date('d F Y'); ?></p>
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; font-family: 'Times New Roman', Times, serif; font-size: 0.85rem; color: #000;">
+        <div style="width: 220px; text-align: center;">
+            <p style="margin-bottom: 55px; margin-top: 0;">Mandor Penanggung Jawab,</p>
+            <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong><?php echo htmlspecialchars($nama_mandor_ttd); ?></strong><br>Mandor Penanggung Jawab</p>
+        </div>
+        <div style="width: 220px; text-align: center;">
+            <p style="margin-bottom: 55px; margin-top: 0;">Disetujui oleh,</p>
             <p style="border-top: 1px solid #000; padding-top: 5px; margin: 0;"><strong><?php echo htmlspecialchars($nama); ?></strong><br>Estate Manager</p>
         </div>
+    </div>
+</div>
+
+<!-- Modal Rincian Detail Monitoring -->
+<div id="monitoringDetailModal" class="modal no-print" style="display:none; position: fixed; z-index: 99999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(15,23,42,0.7); overflow-y: auto; backdrop-filter: blur(4px);">
+    <div class="modal-dialog" style="background: #ffffff; margin: 30px auto; max-width: 750px; border-radius: 14px; padding: 0; box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; color: #1e293b;">
+        
+        <!-- Modal Header -->
+        <div style="background: #f8fafc; padding: 18px 24px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h3 style="margin: 0; font-size: 1.15rem; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px;">
+                    <i class="fa-solid fa-file-invoice" style="color: var(--primary-light);"></i> Lembar Audit Monitoring Laporan
+                </h3>
+                <p style="margin: 3px 0 0 0; font-size: 0.8rem; color: #64748b;">Rincian verifikasi alur bertingkat Karyawan - Mandor - Manajer</p>
+            </div>
+            <button onclick="closeMonitoringDetailModal()" style="background: transparent; border: none; font-size: 1.6rem; cursor: pointer; color: #64748b; line-height: 1;">&times;</button>
+        </div>
+
+        <!-- Modal Body -->
+        <div style="padding: 24px; max-height: 75vh; overflow-y: auto;">
+            
+            <!-- Status Badge Header -->
+            <div style="display: flex; justify-content: space-between; align-items: center; background: #f1f5f9; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px;">
+                <span style="font-size: 0.85rem; font-weight: 600; color: #475569;">Status Alur Verifikasi Saat Ini:</span>
+                <div id="mon_status_badge"></div>
+            </div>
+
+            <!-- Grid 2 Kolom: Data Informasi -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px;">
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">KARYAWAN PELAKSANA</div>
+                    <div id="mon_karyawan" style="font-size: 0.95rem; font-weight: 700; color: #0f172a;">-</div>
+                </div>
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">MANDOR PENANGGUNG JAWAB</div>
+                    <div id="mon_mandor" style="font-size: 0.95rem; font-weight: 700; color: #0f172a;">-</div>
+                </div>
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">TANGGAL KERJA</div>
+                    <div id="mon_tanggal" style="font-size: 0.95rem; font-weight: 700; color: #0f172a;">-</div>
+                </div>
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">JENIS PEKERJAAN</div>
+                    <div id="mon_aktivitas" style="font-size: 0.95rem; font-weight: 700; color: #0f172a;">-</div>
+                </div>
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">TARGET FISIK</div>
+                    <div id="mon_target" style="font-size: 0.95rem; font-weight: 700; color: #0f172a;">-</div>
+                </div>
+                <div style="background: #fafafa; padding: 14px; border-radius: 8px; border: 1px solid #f1f5f9;">
+                    <div style="font-size: 0.75rem; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px;">REALISASI DILAPORKAN</div>
+                    <div id="mon_realisasi" style="font-size: 0.95rem; font-weight: 700; color: #1e5235;">-</div>
+                </div>
+            </div>
+
+            <!-- Foto Bukti Lapangan -->
+            <div style="margin-bottom: 20px;">
+                <div style="font-size: 0.8rem; font-weight: 700; color: #475569; margin-bottom: 8px; display: flex; align-items: center; gap: 6px;">
+                    <i class="fa-solid fa-image" style="color: var(--primary-light);"></i> Foto Bukti Hasil Kerja Karyawan:
+                </div>
+                <div style="text-align: center; background: #0f172a; padding: 10px; border-radius: 10px;">
+                    <img id="mon_foto_bukti" src="" alt="Foto Bukti Lapangan" style="max-height: 250px; width: auto; max-width: 100%; border-radius: 6px; object-fit: contain; display: none;">
+                    <div id="mon_no_foto" style="color: #94a3b8; font-size: 0.85rem; padding: 30px 0;">Tidak ada lampiran foto bukti.</div>
+                </div>
+            </div>
+
+            <!-- Catatan Karyawan -->
+            <div style="margin-bottom: 16px;">
+                <div style="font-size: 0.8rem; font-weight: 700; color: #475569; margin-bottom: 4px;">Catatan Karyawan:</div>
+                <div id="mon_catatan_karyawan" style="background: #f8fafc; padding: 10px 14px; border-radius: 6px; font-size: 0.85rem; color: #334155; border: 1px solid #e2e8f0;">-</div>
+            </div>
+
+            <!-- Audit Trail Alur Verifikasi -->
+            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; margin-bottom: 16px;">
+                <div style="font-size: 0.85rem; font-weight: 700; color: #0f172a; margin-bottom: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+                    <i class="fa-solid fa-timeline" style="color: var(--primary-light);"></i> Audit Trail Log Verifikasi Bertingkat
+                </div>
+                
+                <!-- Step 1: Mandor -->
+                <div style="display: flex; gap: 12px; margin-bottom: 12px;">
+                    <div style="width: 28px; height: 28px; border-radius: 50%; background: #0d6efd1a; color: #0d6efd; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.75rem; flex-shrink: 0;">1</div>
+                    <div style="flex-grow: 1;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-size: 0.83rem; font-weight: 700; color: #1e293b;">Verifikasi Mandor Lapangan</span>
+                            <span id="mon_waktu_mandor" style="font-size: 0.75rem; color: #64748b;">-</span>
+                        </div>
+                        <div id="mon_catatan_mandor" style="font-size: 0.82rem; color: #475569; margin-top: 3px; font-style: italic;">Belum ada catatan mandor.</div>
+                    </div>
+                </div>
+
+                <!-- Step 2: Manajer -->
+                <div style="display: flex; gap: 12px;">
+                    <div style="width: 28px; height: 28px; border-radius: 50%; background: #2e7d321a; color: #2e7d32; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.75rem; flex-shrink: 0;">2</div>
+                    <div style="flex-grow: 1;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-size: 0.83rem; font-weight: 700; color: #1e293b;">Approval Final Manajer Operasional</span>
+                            <span id="mon_waktu_manajer" style="font-size: 0.75rem; color: #64748b;">-</span>
+                        </div>
+                        <div id="mon_catatan_manajer" style="font-size: 0.82rem; color: #475569; margin-top: 3px; font-style: italic;">Belum ada catatan manajer.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bonus / Penalti Result -->
+            <div id="mon_bonus_box" style="background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 0.85rem; font-weight: 700; color: #1b5e20;">Insentif Kinerja Akhir:</span>
+                <span id="mon_bonus_val" style="font-size: 1.1rem; font-weight: 800; color: #1b5e20;">Rp 0</span>
+            </div>
+
+        </div>
+
+        <!-- Modal Footer -->
+        <div style="background: #f8fafc; padding: 14px 24px; border-top: 1px solid #e2e8f0; text-align: right;">
+            <button onclick="closeMonitoringDetailModal()" class="btn btn-secondary btn-sm" style="padding: 7px 22px; font-weight: 600; border-radius: 6px;">Tutup</button>
+        </div>
+
     </div>
 </div>
 
@@ -485,6 +958,50 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
+document.addEventListener('DOMContentLoaded', () => {
+    const ctxMandor = document.getElementById('mandorTaskChart');
+    if (ctxMandor) {
+        <?php
+        $mandor_names = [];
+        $mandor_totals = [];
+        foreach ($mandor_stats as $ms) {
+            $mandor_names[] = $ms['nama'];
+            $mandor_totals[] = $ms['total_tugas'];
+        }
+        ?>
+        new Chart(ctxMandor, {
+            type: 'bar',
+            data: {
+                labels: <?php echo json_encode($mandor_names); ?>,
+                datasets: [{
+                    label: 'Jumlah Tugas',
+                    data: <?php echo json_encode($mandor_totals); ?>,
+                    backgroundColor: 'rgba(13, 110, 253, 0.75)',
+                    borderColor: '#0d6efd',
+                    borderWidth: 1.5,
+                    borderRadius: 6
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { beginAtZero: true, ticks: { precision: 0 } },
+                    x: { grid: { display: false } }
+                }
+            }
+        });
+    }
+});
+
+function toggleMandorDetail(mid) {
+    const el = document.getElementById('mandorDetail' + mid);
+    if (el) {
+        el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+    }
+}
+
 function switchTab(evt, tabId) {
     evt.preventDefault();
     const tabPanels = document.querySelectorAll('.tab-content-panel');
@@ -547,13 +1064,15 @@ function openMonitoringDetailModal(d) {
     setT('mon_mandor', dataObj.nama_mandor || '-');
 
     const fotoImg = document.getElementById('mon_foto_bukti');
+    const noFoto = document.getElementById('mon_no_foto');
     if (fotoImg) {
-        if (dataObj.foto_bukti) {
+        if (dataObj.foto_bukti && dataObj.foto_bukti.trim() !== '') {
             fotoImg.src = dataObj.foto_bukti;
-            fotoImg.style.display = 'block';
-            fotoImg.onclick = () => window.open(dataObj.foto_bukti, '_blank');
+            fotoImg.style.display = 'inline-block';
+            if (noFoto) noFoto.style.display = 'none';
         } else {
             fotoImg.style.display = 'none';
+            if (noFoto) noFoto.style.display = 'block';
         }
     }
 
@@ -571,206 +1090,36 @@ function openMonitoringDetailModal(d) {
     setT('mon_waktu_manajer', dataObj.waktu_manajer || '-');
 
     const bonusBox = document.getElementById('mon_bonus_box');
+    const bonusVal = document.getElementById('mon_bonus_val');
     const bonusNum = Number(dataObj.bonus_diterima || 0);
-    const targetNum = Number(dataObj.target_jumlah || 0);
-    const realisasiNum = Number(dataObj.jumlah_realisasi || 0);
-    const unitStr = dataObj.unit || '';
 
-    if (bonusBox) {
+    if (bonusBox && bonusVal) {
         if (bonusNum > 0) {
-            bonusBox.style.background = '#f0fdf4';
-            bonusBox.style.borderColor = '#bbf7d0';
-            setT('mon_bonus_val', '+Rp ' + bonusNum.toLocaleString('id-ID'));
-            setS('mon_bonus_val', 'color', '#2e7d32');
-            setT('mon_bonus_badge', 'Bonus Kinerja');
-            setS('mon_bonus_badge', 'background', '#dcfce7');
-            setS('mon_bonus_badge', 'color', '#15803d');
-            const surplus = (realisasiNum - targetNum).toFixed(2);
-            setH('mon_bonus_breakdown', `
-                <div><strong>Ketentuan:</strong> Realisasi (${realisasiNum} ${unitStr}) melampaui Target Dasar (${targetNum} ${unitStr}).</div>
-                <div><strong>Surplus Hasil:</strong> +${surplus} ${unitStr} (Surplus Produktif).</div>
-                <div><strong>Skema Insentif:</strong> Nominal bonus dihitung dari kelebihan hasil kerja fisik.</div>
-            `);
-        } else if (bonusNum < 0 || dataObj.status === 'rejected' || dataObj.status === 'pending_manajer_tolak') {
-            bonusBox.style.background = '#fef2f2';
-            bonusBox.style.borderColor = '#fecaca';
-            setT('mon_bonus_val', '-Rp ' + Math.abs(bonusNum).toLocaleString('id-ID'));
-            setS('mon_bonus_val', 'color', '#c62828');
-            setT('mon_bonus_badge', 'Sanksi Denda 10%');
-            setS('mon_bonus_badge', 'background', '#fee2e2');
-            setS('mon_bonus_badge', 'color', '#b91c1c');
-            setH('mon_bonus_breakdown', `
-                <div><strong>Ketentuan:</strong> Terdeteksi pelanggaran / manipulasi data laporan kerja.</div>
-                <div><strong>Dampak Capaian:</strong> Hasil realisasi dianulir menjadi <strong>0 ${unitStr} (0%)</strong>.</div>
-                <div><strong>Denda Penalti:</strong> Pemotongan otomatis 10% sebesar <strong>-Rp ${Math.abs(bonusNum).toLocaleString('id-ID')}</strong> dari akumulasi insentif.</div>
-            `);
+            bonusBox.style.background = '#e8f5e9';
+            bonusBox.style.borderColor = '#a5d6a7';
+            bonusVal.style.color = '#1b5e20';
+            bonusVal.innerText = '+Rp ' + bonusNum.toLocaleString('id-ID');
+        } else if (bonusNum < 0) {
+            bonusBox.style.background = '#ffebee';
+            bonusBox.style.borderColor = '#ef9a9a';
+            bonusVal.style.color = '#c62828';
+            bonusVal.innerText = '-Rp ' + Math.abs(bonusNum).toLocaleString('id-ID');
         } else {
             bonusBox.style.background = '#f8fafc';
             bonusBox.style.borderColor = '#e2e8f0';
-            setT('mon_bonus_val', 'Rp 0 (Target Terpenuhi)');
-            setS('mon_bonus_val', 'color', '#64748b');
-            setT('mon_bonus_badge', 'Standar');
-            setS('mon_bonus_badge', 'background', '#f1f5f9');
-            setS('mon_bonus_badge', 'color', '#475569');
-            setH('mon_bonus_breakdown', `
-                <div><strong>Ketentuan:</strong> Realisasi (${realisasiNum} ${unitStr}) sesuai dengan Target Dasar (${targetNum} ${unitStr}).</div>
-                <div><strong>Keterangan:</strong> Pekerjaan tuntas 100% tanpa kelebihan bonus surplus atau denda sanksi.</div>
-            `);
+            bonusVal.style.color = '#64748b';
+            bonusVal.innerText = 'Rp 0 (Target Standar)';
         }
     }
 
     const modal = document.getElementById('monitoringDetailModal');
-    if (modal) {
-        modal.style.display = 'block';
-    }
+    if (modal) modal.style.display = 'block';
 }
 
 function closeMonitoringDetailModal() {
     const modal = document.getElementById('monitoringDetailModal');
-    if (modal) {
-        modal.style.display = 'none';
-    }
-}
-
-function openReportDetailModal(d) {
-    openMonitoringDetailModal(d);
-}
-function closeReportDetailModal() {
-    closeMonitoringDetailModal();
+    if (modal) modal.style.display = 'none';
 }
 </script>
-
-<!-- Modal Detail Verifikasi & Alur Monitoring -->
-<div id="monitoringDetailModal" class="modal no-print" style="display:none; position: fixed; z-index: 999999; left: 0; top: 0; width: 100%; height: 100%; background: rgba(15,23,42,0.7); overflow-y: auto; backdrop-filter: blur(4px);">
-    <div class="modal-dialog" style="background: #ffffff; margin: 30px auto; max-width: 900px; border-radius: 14px; padding: 0; box-shadow: 0 20px 40px rgba(0,0,0,0.3); overflow: hidden; color: #1e293b;">
-        <!-- Header Modal -->
-        <div style="background: #f8fafc; padding: 18px 24px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center;">
-            <div>
-                <h3 style="margin: 0; font-size: 1.2rem; font-weight: 700; color: #0f172a; display: flex; align-items: center; gap: 8px;">
-                    <i class="fa-solid fa-list-check" style="color: var(--primary-light);"></i> Rincian Detail Alur Verifikasi Laporan Kerja
-                </h3>
-                <p style="margin: 3px 0 0 0; font-size: 0.8rem; color: #64748b;">
-                    Melacak status input laporan karyawan, verifikasi mandor, hingga persetujuan manajer
-                </p>
-            </div>
-            <button onclick="closeMonitoringDetailModal()" style="background: transparent; border: none; font-size: 1.6rem; cursor: pointer; color: #64748b; line-height: 1;">&times;</button>
-        </div>
-
-        <!-- Body Modal (3 Step Panels) -->
-        <div style="padding: 24px; max-height: 80vh; overflow-y: auto;">
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                <!-- Panel Kiri: Input Laporan Karyawan & Foto Bukti -->
-                <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px;">
-                    <h4 style="margin: 0 0 14px 0; font-size: 0.95rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 6px;">
-                        <i class="fa-solid fa-user-pen" style="color: #0d6efd;"></i> 1. Hasil Input Laporan Karyawan
-                    </h4>
-                    
-                    <div style="margin-bottom: 10px;">
-                        <span style="font-size: 0.75rem; color: #64748b; display: block;">Pelaksana / Karyawan:</span>
-                        <strong id="mon_karyawan" style="font-size: 0.95rem; color: #0f172a;">-</strong>
-                    </div>
-
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                        <div>
-                            <span style="font-size: 0.75rem; color: #64748b; display: block;">Tanggal Kerja:</span>
-                            <strong id="mon_tanggal" style="font-size: 0.88rem; color: #334155;">-</strong>
-                        </div>
-                        <div>
-                            <span style="font-size: 0.75rem; color: #64748b; display: block;">Aktivitas:</span>
-                            <strong id="mon_aktivitas" style="font-size: 0.88rem; color: #334155;">-</strong>
-                        </div>
-                    </div>
-
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;">
-                        <div>
-                            <span style="font-size: 0.75rem; color: #64748b; display: block;">Target Dasar:</span>
-                            <span id="mon_target" style="font-weight: 700; color: #15803d; font-size: 0.9rem;">-</span>
-                        </div>
-                        <div>
-                            <span style="font-size: 0.75rem; color: #64748b; display: block;">Realisasi Lapangan:</span>
-                            <span id="mon_realisasi" style="font-weight: 700; color: #2e7d32; font-size: 0.9rem;">-</span>
-                        </div>
-                    </div>
-
-                    <div style="margin-bottom: 14px;">
-                        <span style="font-size: 0.75rem; color: #64748b; display: block;">Catatan / Keterangan Karyawan:</span>
-                        <div id="mon_catatan_karyawan" style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; font-size: 0.82rem; color: #334155; margin-top: 4px; font-style: italic;">
-                            -
-                        </div>
-                    </div>
-
-                    <div>
-                        <span style="font-size: 0.75rem; color: #64748b; display: block; margin-bottom: 4px;">Foto Bukti Fisik Lapangan:</span>
-                        <div id="mon_foto_wrapper">
-                            <img id="mon_foto_bukti" src="" alt="Bukti Fisik" style="width: 100%; height: 170px; object-fit: cover; border-radius: 8px; border: 1px solid #cbd5e1; cursor: pointer;">
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Panel Kanan: Verifikasi Mandor & Persetujuan Manajer -->
-                <div style="display: flex; flex-direction: column; gap: 16px;">
-                    <!-- Section Verifikasi Mandor -->
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px;">
-                        <h4 style="margin: 0 0 10px 0; font-size: 0.95rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 6px;">
-                            <i class="fa-solid fa-user-check" style="color: #0d6efd;"></i> 2. Verifikasi Mandor Lapangan
-                        </h4>
-                        <div style="margin-bottom: 6px;">
-                            <span style="font-size: 0.75rem; color: #64748b;">Mandor Penanggung Jawab:</span>
-                            <strong id="mon_mandor" style="font-size: 0.88rem; display: block; color: #0f172a;">-</strong>
-                        </div>
-                        <div style="margin-bottom: 8px;">
-                            <span style="font-size: 0.75rem; color: #64748b;">Catatan Verifikasi Mandor:</span>
-                            <div id="mon_catatan_mandor" style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; font-size: 0.82rem; color: #334155; margin-top: 3px; font-style: italic;">
-                                -
-                            </div>
-                        </div>
-                        <div style="font-size: 0.76rem; color: #64748b;">
-                            <i class="fa-regular fa-clock"></i> Waktu Verifikasi Mandor: <span id="mon_waktu_mandor" style="font-weight: 600; color: #334155;">-</span>
-                        </div>
-                    </div>
-
-                    <!-- Section Persetujuan Manajer -->
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px;">
-                        <h4 style="margin: 0 0 10px 0; font-size: 0.95rem; font-weight: 700; color: #1e293b; display: flex; align-items: center; gap: 6px;">
-                            <i class="fa-solid fa-user-shield" style="color: #15803d;"></i> 3. Persetujuan Final Manajer
-                        </h4>
-                        <div style="margin-bottom: 6px;">
-                            <span style="font-size: 0.75rem; color: #64748b;">Status Alur Verifikasi:</span>
-                            <div id="mon_status_badge" style="margin-top: 2px;">-</div>
-                        </div>
-                        <div style="margin-bottom: 8px;">
-                            <span style="font-size: 0.75rem; color: #64748b;">Catatan Persetujuan Manajer:</span>
-                            <div id="mon_catatan_manajer" style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; font-size: 0.82rem; color: #334155; margin-top: 3px;">
-                                -
-                            </div>
-                        </div>
-                        <div style="font-size: 0.76rem; color: #64748b;">
-                            <i class="fa-regular fa-clock"></i> Waktu Persetujuan Manajer: <span id="mon_waktu_manajer" style="font-weight: 600; color: #334155;">-</span>
-                        </div>
-                    </div>
-
-                    <!-- Box Summary Bonus / Denda -->
-                    <div id="mon_bonus_box" style="padding: 12px 14px; background: #f0fdf4; border: 1.5px solid #bbf7d0; border-radius: 8px; margin-top: auto;">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-size: 0.73rem; color: #166534; font-weight: 700; text-transform: uppercase;">
-                                <i class="fa-solid fa-calculator"></i> Status Bonus / Denda:
-                            </span>
-                            <span id="mon_bonus_badge" class="badge" style="font-size: 0.7rem;">-</span>
-                        </div>
-                        <div id="mon_bonus_val" style="font-size: 1.15rem; font-weight: 700; color: #2e7d32; margin-top: 3px;">-</div>
-                        <div id="mon_bonus_breakdown" style="margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(0,0,0,0.12); font-size: 0.78rem; color: #334155; line-height: 1.4;">
-                            -
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Footer Modal -->
-        <div style="background: #f8fafc; padding: 14px 24px; border-top: 1px solid #e2e8f0; text-align: right;">
-            <button onclick="closeMonitoringDetailModal()" class="btn btn-secondary btn-sm" style="padding: 7px 22px; font-weight: 600; border-radius: 6px;">Tutup</button>
-        </div>
-    </div>
-</div>
 
 <?php require_once '../includes/footer.php'; ?>
